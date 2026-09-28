@@ -1,0 +1,1386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="ZERODAY — an interactive wireframe environment. Exploring the space between code and creation.">
+  <title>ZERODAY</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23000'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23fff'/%3E%3C/svg%3E">
+
+  <style>
+    /* Everything is in this ONE file on purpose, so nothing can fail to load. */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
+    body {
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* Both canvases cover the entire window, edge to edge. */
+    canvas {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      border: 0;
+      outline: 0;
+    }
+    #scene { z-index: 0; opacity: 0; transition: opacity 2.4s ease; }   /* 3D wireframe world */
+    .is-ready #scene { opacity: 1; }
+    #text  { z-index: 2; pointer-events: none; }                         /* pixel text on top */
+
+    /* Soft black vignette + a very faint white haze in the centre */
+    .vignette {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0) 38%),
+        radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0) 45%, rgba(0,0,0,0.8) 100%);
+    }
+
+    /* Real text for screen readers / search engines. Hidden visually. */
+    .a11y-text {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+
+    /* If WebGL or Three.js can't load, show plain text instead of a black screen */
+    .no-webgl .a11y-text {
+      position: fixed;
+      inset: 0;
+      width: auto;
+      height: auto;
+      margin: 0;
+      overflow: visible;
+      clip: auto;
+      white-space: normal;
+      z-index: 3;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      text-align: center;
+      color: #fff;
+      font-family: monospace;
+    }
+    .no-webgl .a11y-text h1 { margin: 0; letter-spacing: 0.2em; }
+    .no-webgl .a11y-text p  { margin: 0; }
+    .no-webgl .a11y-text::after {
+      content: "This experience needs WebGL and an internet connection (to load Three.js).";
+      font-size: 0.75rem;
+      opacity: 0.6;
+    }
+  </style>
+</head>
+<body>
+
+  <canvas id="scene" aria-hidden="true"></canvas>
+  <div class="vignette" aria-hidden="true"></div>
+  <canvas id="text" aria-hidden="true"></canvas>
+
+  <div class="a11y-text">
+    <h1>ZERODAY</h1>
+    <p>Digital / Experimental / 001</p>
+    <p>Exploring the space between code and creation.</p>
+  </div>
+
+  <!-- Three.js from a CDN (no npm, no build step) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <script>
+/* =========================================================================
+   ZERODAY
+   A fullscreen black Three.js environment of thin white wireframes, particles
+   and lines, with a Minecraft-style pixel title that lives INSIDE that world:
+   it assembles out of scattered pixels, is pulled by the cursor's gravity,
+   and is shaken by the same shockwave that ripples through the wireframes.
+
+   Sections:
+     1. Config
+     2. Environment
+     3. Renderer, scene and camera
+     4. Materials (shaders)
+     5. Geometry (wireframe world)
+     6. Particles
+     7. Interaction (mouse, click, fullscreen key)
+     8. Pixel text (Minecraft-style font, layout, animation)
+     9. Animation loop
+    10. Resize handling
+   ========================================================================= */
+
+(function () {
+  'use strict';
+
+  const root = document.documentElement;
+
+  // If the Three.js CDN script didn't load (offline, blocked...), stop politely.
+  if (typeof THREE === 'undefined') {
+    root.classList.add('no-webgl');
+    console.error('ZERODAY: Three.js did not load. Check your internet connection.');
+    return;
+  }
+
+  /* =======================================================================
+     1. CONFIG — change these to customise the experience
+     ======================================================================= */
+  const CONFIG = {
+    particleCount: { desktop: 1800, mobile: 700 },      // floating particles
+    constellationNodes: { desktop: 80, mobile: 46 },    // connected points
+
+    animationSpeed: 1.0,      // 1 = normal, 0.5 = half speed, 2 = double
+    wireframeOpacity: 1.0,    // brightness of ALL lines and points
+    mouseSensitivity: 1.0,    // how strongly the scene follows the cursor
+
+    titleScale: 1.0,          // size of the ZERODAY pixel title (1.2 = 20% bigger)
+    textGlow: 1.0,            // strength of the glow around the pixel text
+    titleReaction: 1.0,       // how much the title moves with the cursor
+
+    cursorRadius: 4.2,        // size of the cursor's gravity field
+    cursorForce: 1.1,         // + attracts, - repels
+    clickStrength: 1.0,       // strength of the click shockwave
+
+    maxPixelRatio: 2          // caps resolution on high-DPI screens (lower = faster)
+  };
+
+  /* =======================================================================
+     2. ENVIRONMENT
+     ======================================================================= */
+  const isTouch = window.matchMedia('(hover: none), (pointer: coarse)').matches;
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const lowPower = (navigator.hardwareConcurrency || 8) <= 4;
+  const profile = isTouch ? 'mobile' : 'desktop';
+
+  const QUALITY_LEVELS = [
+    { pixelRatio: CONFIG.maxPixelRatio, particles: 1.0 },
+    { pixelRatio: 1.5,                  particles: 0.6 },
+    { pixelRatio: 1.0,                  particles: 0.35 }
+  ];
+  let qualityLevel = (isTouch || lowPower) ? 1 : 0;
+
+  // Seeded random generator: the layout is the same on every visit.
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rand = mulberry32(2026);
+
+  // Frame-rate independent smoothing (higher rate = snappier).
+  function smooth(dt, rate) { return 1 - Math.exp(-dt * rate); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function easeOutCubic(p) { const q = 1 - p; return 1 - q * q * q; }
+
+  /* =======================================================================
+     3. RENDERER, SCENE AND CAMERA
+     ======================================================================= */
+  const canvas = document.getElementById('scene');
+  const textCanvas = document.getElementById('text');
+
+  // Belt and braces: force edge-to-edge black even if the CSS were ever ignored.
+  root.style.background = '#000';
+  document.body.style.margin = '0';
+  document.body.style.background = '#000';
+  [canvas, textCanvas].forEach(function (c) {
+    c.style.position = 'fixed';
+    c.style.left = '0';
+    c.style.top = '0';
+    c.style.width = '100%';
+    c.style.height = '100%';
+    c.style.display = 'block';
+  });
+
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({
+      canvas: canvas,
+      antialias: !isTouch,
+      alpha: false,
+      powerPreference: 'high-performance'
+    });
+  } catch (err) {
+    root.classList.add('no-webgl');
+    console.error('ZERODAY: could not start WebGL.', err);
+    return;
+  }
+  renderer.setClearColor(0x000000, 1);
+  renderer.sortObjects = false;
+
+  let width = window.innerWidth;
+  let height = window.innerHeight;
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 200);
+  const TAN_HALF_FOV = Math.tan(25 * Math.PI / 180);   // used to convert 3D units to screen pixels
+
+  let baseZ = 17;
+  function updateCameraFraming() {
+    const aspect = width / height;
+    baseZ = aspect >= 1 ? 17 : 17 + (1 - aspect) * 22;
+  }
+  updateCameraFraming();
+  camera.position.set(0, 0, baseZ);
+
+  /* =======================================================================
+     4. MATERIALS — shaders
+     The cursor "gravity well" and the click shockwave are computed on the GPU.
+     ======================================================================= */
+  const PULSE_SPEED = 7.0;   // shockwave speed (3D units per second)
+  const PULSE_LIFE = 3.4;    // shockwave lifetime (seconds)
+
+  const shared = {
+    uTime:  { value: 0 },
+    uClock: { value: 0 },
+    uMouse: { value: new THREE.Vector3(0, 0, 999) },
+    uDisturb: { value: 0 },
+    uRadius: { value: CONFIG.cursorRadius },
+    uForce:  { value: CONFIG.cursorForce },
+    uPulses: { value: [
+      new THREE.Vector4(0, 0, 0, -1),
+      new THREE.Vector4(0, 0, 0, -1),
+      new THREE.Vector4(0, 0, 0, -1)
+    ] },
+    uPulseStrength: { value: 1.1 * CONFIG.clickStrength },
+    uNear: { value: 16 },
+    uFar:  { value: 64 },
+    uBoost: { value: 0 },
+    uPixelRatio: { value: 1 }
+  };
+
+  const GLSL_DISTURB = `
+    uniform float uTime;
+    uniform float uClock;
+    uniform vec3  uMouse;
+    uniform float uDisturb;
+    uniform float uRadius;
+    uniform float uForce;
+    uniform vec4  uPulses[3];
+    uniform float uPulseStrength;
+    uniform float uNear;
+    uniform float uFar;
+
+    vec3 applyDisturbance(vec3 wp, out float glow) {
+      vec3 p = wp;
+      glow = 0.0;
+
+      // ---- Cursor gravity well ----
+      vec3 d = wp - uMouse;
+      d.z *= 0.35;
+      float dist = length(d);
+      if (uDisturb > 0.001 && dist < uRadius && dist > 0.0001) {
+        float k = dist / uRadius;
+        float well = pow(max(sin(k * 3.14159265), 0.0), 1.5);
+        vec3 dir = d / dist;
+        p -= dir * well * uForce * uDisturb;
+        p += vec3(-dir.y, dir.x, 0.0) * well * uForce * 0.35 * uDisturb;
+        glow += well * 0.12 * uDisturb;
+      }
+
+      // ---- Click shockwaves ----
+      for (int i = 0; i < 3; i++) {
+        vec4 pu = uPulses[i];
+        float age = uClock - pu.w;
+        if (pu.w >= 0.0 && age > 0.0 && age < ${PULSE_LIFE.toFixed(1)}) {
+          vec3 pd = wp - pu.xyz;
+          float pdist = length(pd);
+          float q = (pdist - age * ${PULSE_SPEED.toFixed(1)}) / 1.7;
+          float band = exp(-q * q);
+          float fade = exp(-age * 0.85);
+          vec3 pdir = pdist > 0.0001 ? pd / pdist : vec3(0.0, 1.0, 0.0);
+          p += pdir * band * fade * uPulseStrength;
+          glow += band * fade * 0.7;
+        }
+      }
+      return p;
+    }
+  `;
+
+  const LINE_VERT = GLSL_DISTURB + `
+    uniform float uOpacity;
+    uniform float uWave;
+    uniform float uRadial;
+    varying float vAlpha;
+    varying float vGlow;
+
+    void main() {
+      vec3 lp = position;
+      lp.y += uWave * (sin(lp.x * 0.35 + uTime * 0.5) + cos(lp.z * 0.28 + uTime * 0.35)) * 0.5;
+
+      vec4 wp = modelMatrix * vec4(lp, 1.0);
+      float glow;
+      vec3 p = applyDisturbance(wp.xyz, glow);
+
+      vec4 mv = viewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * mv;
+
+      float depth = -mv.z;
+      float fade = 1.0 - smoothstep(uNear, uFar, depth);
+      float radial = uRadial > 0.0 ? 1.0 - smoothstep(uRadial * 0.2, uRadial, length(wp.xz)) : 1.0;
+      vAlpha = uOpacity * fade * radial;
+      vGlow = glow * fade * radial;
+    }
+  `;
+  const LINE_FRAG = `
+    uniform float uBoost;
+    varying float vAlpha;
+    varying float vGlow;
+    void main() {
+      float a = vAlpha * (1.0 + uBoost * 1.2) + vGlow * 0.5;
+      gl_FragColor = vec4(1.0, 1.0, 1.0, clamp(a, 0.0, 1.0));
+    }
+  `;
+
+  const POINT_VERT = GLSL_DISTURB + `
+    attribute float aSeed;
+    attribute float aSize;
+    uniform float uPixelRatio;
+    uniform float uPointSize;
+    uniform float uPointOpacity;
+    uniform float uDrift;
+    varying float vAlpha;
+    varying float vGlow;
+
+    void main() {
+      float t = uTime * 0.15;
+      vec3 lp = position + uDrift * 0.9 * vec3(
+        sin(t * 1.3 + aSeed * 6.2831) + sin(t * 0.53 + aSeed * 17.0),
+        cos(t * 1.1 + aSeed * 11.0)   + sin(t * 0.37 + aSeed * 5.0),
+        sin(t * 0.9 + aSeed * 3.0)    + cos(t * 0.61 + aSeed * 13.0)
+      );
+
+      vec4 wp = modelMatrix * vec4(lp, 1.0);
+      float glow;
+      vec3 p = applyDisturbance(wp.xyz, glow);
+
+      vec4 mv = viewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * mv;
+
+      float depth = -mv.z;
+      float fade = 1.0 - smoothstep(uNear, uFar, depth);
+      float twinkle = 0.65 + 0.35 * sin(uTime * 0.8 + aSeed * 40.0);
+      vAlpha = uPointOpacity * fade * twinkle * (0.4 + 0.6 * fract(aSeed * 91.7));
+      vGlow = glow * fade;
+
+      gl_PointSize = max(aSize * uPointSize * uPixelRatio * (26.0 / max(depth, 4.0)), 1.2);
+    }
+  `;
+  const POINT_FRAG = `
+    uniform float uBoost;
+    varying float vAlpha;
+    varying float vGlow;
+    void main() {
+      float d = length(gl_PointCoord - 0.5);
+      if (d > 0.5) discard;
+      float s = 1.0 - smoothstep(0.0, 0.5, d);
+      s *= s;
+      float a = (vAlpha * (1.0 + uBoost) + vGlow * 0.6) * s;
+      gl_FragColor = vec4(1.0, 1.0, 1.0, clamp(a, 0.0, 1.0));
+    }
+  `;
+
+  function baseMaterialSettings() {
+    return { transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending };
+  }
+
+  function makeLineMaterial(opacity, options) {
+    options = options || {};
+    return new THREE.ShaderMaterial(Object.assign({
+      uniforms: Object.assign({}, shared, {
+        uOpacity: { value: opacity * CONFIG.wireframeOpacity },
+        uWave:    { value: options.wave || 0 },
+        uRadial:  { value: options.radial || 0 }
+      }),
+      vertexShader: LINE_VERT,
+      fragmentShader: LINE_FRAG
+    }, baseMaterialSettings()));
+  }
+
+  function makePointMaterial(size, opacity, drift) {
+    return new THREE.ShaderMaterial(Object.assign({
+      uniforms: Object.assign({}, shared, {
+        uPointSize:    { value: size },
+        uPointOpacity: { value: opacity * CONFIG.wireframeOpacity },
+        uDrift:        { value: drift }
+      }),
+      vertexShader: POINT_VERT,
+      fragmentShader: POINT_FRAG
+    }, baseMaterialSettings()));
+  }
+
+  /* =======================================================================
+     5. GEOMETRY — the wireframe world
+     ======================================================================= */
+
+  // One straight line, split into short pieces so the cursor can bend it.
+  function pushSegment(out, ax, ay, az, bx, by, bz, splits) {
+    for (let s = 0; s < splits; s++) {
+      const t0 = s / splits, t1 = (s + 1) / splits;
+      out.push(
+        ax + (bx - ax) * t0, ay + (by - ay) * t0, az + (bz - az) * t0,
+        ax + (bx - ax) * t1, ay + (by - ay) * t1, az + (bz - az) * t1
+      );
+    }
+  }
+
+  // Clean edge lines of any Three.js shape (no doubled or diagonal lines).
+  function edgesOf(geometry, splits) {
+    const edges = new THREE.EdgesGeometry(geometry);
+    const src = edges.attributes.position.array;
+    const out = [];
+    for (let i = 0; i < src.length; i += 6) {
+      pushSegment(out, src[i], src[i + 1], src[i + 2], src[i + 3], src[i + 4], src[i + 5], splits);
+    }
+    edges.dispose();
+    geometry.dispose();
+    return out;
+  }
+
+  function makeLines(coords, material, parent) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(coords), 3));
+    const lines = new THREE.LineSegments(geo, material);
+    lines.frustumCulled = false;
+    if (parent) parent.add(lines);
+    return lines;
+  }
+
+  function circleCoords(radius, segments) {
+    const out = [];
+    for (let i = 0; i < segments; i++) {
+      const a0 = (i / segments) * Math.PI * 2;
+      const a1 = ((i + 1) / segments) * Math.PI * 2;
+      out.push(Math.cos(a0) * radius, Math.sin(a0) * radius, 0,
+               Math.cos(a1) * radius, Math.sin(a1) * radius, 0);
+    }
+    return out;
+  }
+
+  function tickCoords(radius, count) {
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2;
+      const len = (i % 8 === 0) ? 0.6 : 0.22;
+      const c = Math.cos(a), s = Math.sin(a);
+      out.push(c * radius, s * radius, 0, c * (radius + len), s * (radius + len), 0);
+    }
+    return out;
+  }
+
+  const world = new THREE.Group();   // rotating structures
+  const far = new THREE.Group();     // distant particles + lines (slower parallax)
+  scene.add(world);
+  scene.add(far);
+
+  // Every layer spins on its own and reacts to the mouse with its own inertia.
+  const layers = [];
+  function addLayer(object, cfg) {
+    world.add(object);
+    layers.push({
+      object: object,
+      spin: cfg.spin || [0, 0, 0],
+      offset: cfg.offset || [0, 0, 0],
+      gain: cfg.gain || [0, 0],
+      rate: cfg.rate || 2,
+      breathe: cfg.breathe || 0,
+      pulse: cfg.pulse || 0,
+      phase: rand() * 100,
+      px: 0,
+      py: 0
+    });
+  }
+
+  // Nested polyhedra
+  const outerGroup = new THREE.Group();
+  makeLines(edgesOf(new THREE.IcosahedronGeometry(7.6, 2), 3), makeLineMaterial(0.38), outerGroup);
+  addLayer(outerGroup, { spin: [0.010, 0.022, 0.0], gain: [0.30, 0.50], rate: 1.4, breathe: 0.02, pulse: 0.07 });
+
+  const middleGroup = new THREE.Group();
+  makeLines(edgesOf(new THREE.IcosahedronGeometry(5.0, 1), 4), makeLineMaterial(0.50), middleGroup);
+  addLayer(middleGroup, { spin: [-0.031, 0.018, 0.012], gain: [-0.55, -0.80], rate: 2.1, breathe: 0.015, pulse: 0.09 });
+
+  const innerGroup = new THREE.Group();
+  makeLines(edgesOf(new THREE.DodecahedronGeometry(3.1, 0), 4), makeLineMaterial(0.65), innerGroup);
+  addLayer(innerGroup, { spin: [0.05, -0.04, 0.02], gain: [0.9, 1.3], rate: 3.0, pulse: 0.12 });
+
+  const coreGroup = new THREE.Group();
+  makeLines(edgesOf(new THREE.OctahedronGeometry(1.5, 0), 6), makeLineMaterial(0.85), coreGroup);
+  addLayer(coreGroup, { spin: [-0.09, 0.07, 0.05], gain: [-1.2, -1.6], rate: 3.8, pulse: 0.16 });
+
+  // Orbital rings (the first has instrument-style tick marks)
+  const ringSpecs = [
+    { radius: 9.8,  opacity: 0.34, ticks: true,  offset: [1.20,  0.20, 0.00], spin: [0.004,  0.002,  0.030] },
+    { radius: 11.6, opacity: 0.24, ticks: false, offset: [-0.50, 0.90, 0.30], spin: [0.000,  0.012, -0.020] },
+    { radius: 13.4, opacity: 0.18, ticks: false, offset: [0.20, -0.70, 1.10], spin: [0.006, -0.010,  0.015] }
+  ];
+  ringSpecs.forEach(function (spec) {
+    const g = new THREE.Group();
+    makeLines(circleCoords(spec.radius, 192), makeLineMaterial(spec.opacity), g);
+    if (spec.ticks) makeLines(tickCoords(spec.radius, 96), makeLineMaterial(0.5), g);
+    addLayer(g, { spin: spec.spin, offset: spec.offset, gain: [0.15, 0.25], rate: 1.0 });
+  });
+
+  // Constellation: nodes joined to their nearest neighbours
+  (function buildConstellation() {
+    const count = CONFIG.constellationNodes[profile];
+    const nodes = [];
+    for (let i = 0; i < count; i++) {
+      const r = 8.5 + rand() * 7.5;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      nodes.push([
+        r * Math.sin(phi) * Math.cos(theta),
+        r * Math.cos(phi) * 0.8,
+        r * Math.sin(phi) * Math.sin(theta)
+      ]);
+    }
+
+    const seen = new Set();
+    const lineCoords = [];
+    for (let i = 0; i < count; i++) {
+      const dists = [];
+      for (let j = 0; j < count; j++) {
+        if (i === j) continue;
+        const dx = nodes[i][0] - nodes[j][0], dy = nodes[i][1] - nodes[j][1], dz = nodes[i][2] - nodes[j][2];
+        dists.push({ j: j, d: Math.sqrt(dx * dx + dy * dy + dz * dz) });
+      }
+      dists.sort(function (a, b) { return a.d - b.d; });
+      for (let n = 0; n < 2; n++) {
+        const near = dists[n];
+        if (near.d > 6.5) continue;
+        const key = i < near.j ? i + '-' + near.j : near.j + '-' + i;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const a = nodes[i], b = nodes[near.j];
+        pushSegment(lineCoords, a[0], a[1], a[2], b[0], b[1], b[2], 8);
+      }
+    }
+
+    const group = new THREE.Group();
+    makeLines(lineCoords, makeLineMaterial(0.24), group);
+    group.add(makePointCloud(nodes.flat(), 1.4, 2.4, makePointMaterial(1.0, 0.9, 0.0)));
+    addLayer(group, { spin: [0.003, 0.012, 0.0], gain: [0.20, 0.32], rate: 0.9 });
+  })();
+
+  // Perspective grid: floor + fainter ceiling
+  function gridCoords(size, step, pieceLength) {
+    const out = [];
+    const half = size / 2;
+    const lineCount = Math.round(size / step);
+    const pieces = Math.round(size / pieceLength);
+    for (let i = 0; i <= lineCount; i++) {
+      const c = -half + i * step;
+      for (let s = 0; s < pieces; s++) {
+        const a = -half + s * pieceLength, b = a + pieceLength;
+        out.push(c, 0, a, c, 0, b);
+        out.push(a, 0, c, b, 0, c);
+      }
+    }
+    return out;
+  }
+  const gridCoordsData = gridCoords(120, 6, 3);
+  const floorGrid = makeLines(gridCoordsData, makeLineMaterial(0.20, { wave: 0.35, radial: 70 }));
+  floorGrid.position.set(0, -9.5, -10);
+  scene.add(floorGrid);
+  const ceilingGrid = makeLines(gridCoordsData, makeLineMaterial(0.10, { wave: 0.35, radial: 70 }));
+  ceilingGrid.position.set(0, 15, -10);
+  scene.add(ceilingGrid);
+
+  // Floating axis-aligned lines and small crosshair markers
+  (function buildFloatingLines() {
+    const lineCoords = [];
+    for (let i = 0; i < 70; i++) {
+      const axis = Math.floor(rand() * 3);
+      const len = 2 + rand() * 5;
+      const p = [(rand() - 0.5) * 64, (rand() - 0.5) * 36, -40 + rand() * 46];
+      const q = p.slice();
+      q[axis] += len;
+      pushSegment(lineCoords, p[0], p[1], p[2], q[0], q[1], q[2], 6);
+    }
+    makeLines(lineCoords, makeLineMaterial(0.20), far);
+
+    const markCoords = [];
+    for (let i = 0; i < 28; i++) {
+      const x = (rand() - 0.5) * 60, y = (rand() - 0.5) * 34, z = -36 + rand() * 40;
+      const h = 0.28;
+      markCoords.push(x - h, y, z, x + h, y, z,  x, y - h, z, x, y + h, z,  x, y, z - h, x, y, z + h);
+    }
+    makeLines(markCoords, makeLineMaterial(0.45), far);
+  })();
+
+  /* =======================================================================
+     6. PARTICLES
+     ======================================================================= */
+  function makePointCloud(positions, sizeMin, sizeMax, material) {
+    const n = positions.length / 3;
+    const seeds = new Float32Array(n);
+    const sizes = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      seeds[i] = rand();
+      sizes[i] = sizeMin + rand() * (sizeMax - sizeMin);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
+    geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+    const points = new THREE.Points(geo, material);
+    points.frustumCulled = false;
+    return points;
+  }
+
+  const particleCount = CONFIG.particleCount[profile];
+  const particlePositions = [];
+  for (let i = 0; i < particleCount; i++) {
+    particlePositions.push(
+      (rand() - 0.5) * 90,
+      (rand() - 0.5) * 50,
+      -55 + rand() * 63
+    );
+  }
+  const particles = makePointCloud(particlePositions, 0.6, 1.8, makePointMaterial(1.0, 0.85, 1.0));
+  far.add(particles);
+
+  /* =======================================================================
+     7. INTERACTION — mouse, click, fullscreen key
+     ======================================================================= */
+  const pointer = { x: 0, y: 0, inside: false, lastInput: -100 };   // -1..1, y up
+  const steer = { x: 0, y: 0 };      // smoothed pointer: nothing snaps to the mouse
+  let energy = 0;                    // click energy (decays)
+  let clockTime = 0;                 // real seconds
+  let simTime = 0;                   // scene seconds (scaled by animationSpeed)
+
+  const SENS = CONFIG.mouseSensitivity * (reducedMotion ? 0.35 : 1);
+
+  function setPointerFromEvent(e) {
+    pointer.x = (e.clientX / width) * 2 - 1;
+    pointer.y = -((e.clientY / height) * 2 - 1);
+    pointer.lastInput = clockTime;
+  }
+
+  window.addEventListener('pointermove', function (e) {
+    setPointerFromEvent(e);
+    pointer.inside = (e.pointerType === 'mouse' || e.pointerType === 'pen');
+  }, { passive: true });
+
+  root.addEventListener('mouseleave', function () { pointer.inside = false; });
+  window.addEventListener('blur', function () { pointer.inside = false; });
+
+  // Press F for true fullscreen (Esc exits).
+  window.addEventListener('keydown', function (e) {
+    if (e.key !== 'f' && e.key !== 'F') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!document.fullscreenElement) {
+      if (root.requestFullscreen) root.requestFullscreen().catch(function () {});
+    } else if (document.exitFullscreen) {
+      document.exitFullscreen();
+    }
+  });
+
+  const _v = new THREE.Vector3();
+  const _dir = new THREE.Vector3();
+  function pointerToWorld(nx, ny, target) {
+    _v.set(nx, ny, 0.5).unproject(camera);
+    _dir.copy(_v).sub(camera.position).normalize();
+    const t = -camera.position.z / _dir.z;
+    return target.copy(camera.position).addScaledVector(_dir, t);
+  }
+
+  // Click ring
+  const ringPoints = [];
+  for (let i = 0; i < 160; i++) {
+    const a = (i / 160) * Math.PI * 2;
+    ringPoints.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+  }
+  const ringGeometry = new THREE.BufferGeometry().setFromPoints(ringPoints);
+  const pulseRings = [];
+  for (let i = 0; i < 3; i++) {
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending
+    });
+    const ring = new THREE.LineLoop(ringGeometry, mat);
+    ring.visible = false;
+    ring.frustumCulled = false;
+    scene.add(ring);
+    pulseRings.push({ mesh: ring, start: -1 });
+  }
+
+  // The pixel text needs the click position in screen pixels too.
+  const textPulses = [
+    { x: 0, y: 0, start: -1 },
+    { x: 0, y: 0, start: -1 },
+    { x: 0, y: 0, start: -1 }
+  ];
+
+  let pulseIndex = 0;
+  const _clickPoint = new THREE.Vector3();
+  function triggerPulse() {
+    pointerToWorld(pointer.x, pointer.y, _clickPoint);
+    const i = pulseIndex++ % 3;
+    shared.uPulses.value[i].set(_clickPoint.x, _clickPoint.y, _clickPoint.z, clockTime);
+    pulseRings[i].start = clockTime;
+    pulseRings[i].mesh.position.copy(_clickPoint);
+
+    textPulses[i].x = (pointer.x * 0.5 + 0.5) * TW;
+    textPulses[i].y = (0.5 - pointer.y * 0.5) * TH;
+    textPulses[i].start = clockTime;
+
+    energy = Math.min(energy + 0.9 * CONFIG.clickStrength, 1.6);
+  }
+
+  window.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    setPointerFromEvent(e);
+    if (e.pointerType === 'touch') pointer.inside = false;
+    triggerPulse();
+  }, { passive: true });
+
+  /* =======================================================================
+     8. PIXEL TEXT — a Minecraft-style bitmap font drawn on a 2D canvas
+     Every letter is a grid of square "pixels" (5 x 7). The big title keeps each
+     pixel as its own little object so it can fly in, be pulled by the cursor and
+     be shaken by shockwaves. Small labels are pre-drawn once and typed out.
+     ======================================================================= */
+
+  // ---- The font: each glyph is 7 rows, separated by "/". # = filled ----
+  const GLYPH_SRC = {
+    'A': '.###./#...#/#...#/#####/#...#/#...#/#...#',
+    'B': '####./#...#/#...#/####./#...#/#...#/####.',
+    'C': '.###./#...#/#..../#..../#..../#...#/.###.',
+    'D': '####./#...#/#...#/#...#/#...#/#...#/####.',
+    'E': '#####/#..../#..../####./#..../#..../#####',
+    'F': '#####/#..../#..../####./#..../#..../#....',
+    'G': '.###./#...#/#..../#.###/#...#/#...#/.###.',
+    'H': '#...#/#...#/#...#/#####/#...#/#...#/#...#',
+    'I': '.###./..#../..#../..#../..#../..#../.###.',
+    'J': '..###/...#./...#./...#./...#./#..#./.##..',
+    'K': '#...#/#..#./#.#../##.../#.#../#..#./#...#',
+    'L': '#..../#..../#..../#..../#..../#..../#####',
+    'M': '#...#/##.##/#.#.#/#.#.#/#...#/#...#/#...#',
+    'N': '#...#/##..#/#.#.#/#..##/#...#/#...#/#...#',
+    'O': '.###./#...#/#...#/#...#/#...#/#...#/.###.',
+    'P': '####./#...#/#...#/####./#..../#..../#....',
+    'Q': '.###./#...#/#...#/#...#/#.#.#/#..#./.##.#',
+    'R': '####./#...#/#...#/####./#.#../#..#./#...#',
+    'S': '.####/#..../#..../.###./....#/....#/####.',
+    'T': '#####/..#../..#../..#../..#../..#../..#..',
+    'U': '#...#/#...#/#...#/#...#/#...#/#...#/.###.',
+    'V': '#...#/#...#/#...#/#...#/#...#/.#.#./..#..',
+    'W': '#...#/#...#/#...#/#.#.#/#.#.#/##.##/#...#',
+    'X': '#...#/#...#/.#.#./..#../.#.#./#...#/#...#',
+    'Y': '#...#/#...#/.#.#./..#../..#../..#../..#..',
+    'Z': '#####/....#/...#./..#../.#.../#..../#####',
+    '0': '.###./#...#/#..##/#.#.#/##..#/#...#/.###.',
+    '1': '..#../.##../..#../..#../..#../..#../.###.',
+    '2': '.###./#...#/....#/...#./..#../.#.../#####',
+    '3': '.###./#...#/....#/..##./....#/#...#/.###.',
+    '4': '...#./..##./.#.#./#..#./#####/...#./...#.',
+    '5': '#####/#..../####./....#/....#/#...#/.###.',
+    '6': '..##./.#.../#..../####./#...#/#...#/.###.',
+    '7': '#####/....#/...#./..#../.#.../.#.../.#...',
+    '8': '.###./#...#/#...#/.###./#...#/#...#/.###.',
+    '9': '.###./#...#/#...#/.####/....#/...#./.##..',
+    '/': '....#/....#/...#./..#../.#.../#..../#....',
+    '.': '...../...../...../...../...../.##../.##..',
+    ' ': '.../.../.../.../.../.../...',
+    '©': '..###../.#...#./#.###.#/#.#...#/#.###.#/.#...#./..###..',
+    '*': '...../.###./#####/#####/#####/.###./.....'      // the round status dot
+  };
+  const GLYPHS = {};
+  Object.keys(GLYPH_SRC).forEach(function (k) { GLYPHS[k] = GLYPH_SRC[k].split('/'); });
+
+  // Turns a string into a flat list of filled cells [col,row, col,row ...]
+  // "edges" = the column where each character ends (used for typing effects).
+  function layoutText(str) {
+    const cells = [];
+    const edges = [];
+    let col = 0;
+    for (let i = 0; i < str.length; i++) {
+      const g = GLYPHS[str[i]] || GLYPHS[' '];
+      const w = g[0].length;
+      for (let r = 0; r < 7; r++) {
+        for (let c = 0; c < w; c++) {
+          if (g[r].charAt(c) === '#') cells.push(col + c, r);
+        }
+      }
+      col += w;
+      edges.push(col);
+      col += 1;                      // one empty column between characters
+    }
+    return { cells: cells, edges: edges, cols: col - 1 };
+  }
+
+  const TAG_TEXT = 'DIGITAL / EXPERIMENTAL / 001';
+  const SUB_1 = 'EXPLORING THE SPACE BETWEEN';
+  const SUB_2 = 'CODE AND CREATION.';
+  const HINT_TEXT = isTouch ? 'TOUCH TO EXPLORE' : 'MOVE TO EXPLORE';
+
+  // Soft round glow sprite, used (with additive blending) to make the pixels glow.
+  const haloSprite = (function () {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, 'rgba(255,255,255,1)');
+    gr.addColorStop(0.3, 'rgba(255,255,255,0.4)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, 128, 128);
+    return c;
+  })();
+
+  // Pre-draws a small piece of text (with Minecraft-style grey drop shadow and glow).
+  function makeTextSprite(str, cell, blur) {
+    const lay = layoutText(str);
+    const gap = Math.max(1, Math.round(cell * 0.07));
+    const size = cell - gap;
+    const so = Math.max(1, Math.round(cell * 0.85));           // shadow offset
+    const pad = Math.ceil(blur * 1.5) + so + cell;
+    const w = lay.cols * cell + pad * 2 + so;
+    const h = 7 * cell + pad * 2 + so;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const g = c.getContext('2d');
+    let i;
+
+    g.fillStyle = '#3a3a3a';                                    // the drop shadow
+    for (i = 0; i < lay.cells.length; i += 2) {
+      g.fillRect(pad + lay.cells[i] * cell + so, pad + lay.cells[i + 1] * cell + so, size, size);
+    }
+    g.shadowColor = 'rgba(255,255,255,0.75)';                   // glow
+    g.shadowBlur = blur;
+    g.fillStyle = '#ffffff';
+    for (i = 0; i < lay.cells.length; i += 2) {
+      g.fillRect(pad + lay.cells[i] * cell, pad + lay.cells[i + 1] * cell, size, size);
+    }
+
+    return {
+      canvas: c, w: w, h: h, pad: pad, cell: cell, cols: lay.cols, chars: str.length,
+      edges: lay.edges.map(function (e) { return pad + e * cell; })
+    };
+  }
+
+  const tctx = textCanvas.getContext('2d');
+  let TW = 1, TH = 1;                 // text canvas size in device pixels
+  const T = {};                       // everything the layout produces
+  const field = { x: 0, y: 0 };       // the cursor field position on the text canvas
+
+  // Draws a sprite; "progress" (0..1) types it out character by character.
+  function drawSprite(sp, x, y, progress, alpha) {
+    if (progress <= 0 || alpha <= 0) return;
+    tctx.globalAlpha = alpha;
+    if (progress >= 1) {
+      tctx.drawImage(sp.canvas, x - sp.pad, y - sp.pad);
+      return;
+    }
+    const n = Math.floor(progress * sp.chars + 0.0001);
+    if (n <= 0) return;
+    const cw = Math.min(sp.w, sp.edges[n - 1] + Math.round(sp.cell * 0.9));
+    tctx.drawImage(sp.canvas, 0, 0, cw, sp.h, x - sp.pad, y - sp.pad, cw, sp.h);
+  }
+
+  // Works out sizes and positions for everything. Runs at start and on every resize.
+  function buildTextLayout() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    TW = Math.max(1, Math.floor(width * dpr));
+    TH = Math.max(1, Math.floor(height * dpr));
+    textCanvas.width = TW;
+    textCanvas.height = TH;
+    T.dpr = dpr;
+
+    // On tall/narrow screens the title stacks on two lines (ZERO / DAY) so it stays big.
+    const portrait = width / height < 0.95;
+    const lines = portrait ? ['ZERO', 'DAY'] : ['ZERODAY'];
+    const lineData = lines.map(layoutText);
+    const maxCols = Math.max.apply(null, lineData.map(function (l) { return l.cols; }));
+    const rows = 7 * lines.length + 2 * (lines.length - 1);
+
+    const tagCols = layoutText(TAG_TEXT).cols;
+    const subCols = Math.max(layoutText(SUB_1).cols, layoutText(SUB_2).cols);
+
+    function measureStack(c) {
+      const tagCell = Math.max(2, Math.min(Math.round(c * 0.075), Math.floor(TW * 0.9 / tagCols)));
+      const subCell = Math.max(2, Math.min(Math.round(c * 0.10), Math.floor(TW * 0.9 / subCols)));
+      const ruleCell = Math.max(2, Math.round(subCell * 0.75));
+      const g1 = Math.round(c * 1.3);
+      const g2 = Math.round(c * 1.1);
+      const titleH = rows * c;
+      const subH = 7 * subCell * 2 + 3 * subCell;
+      const total = 7 * tagCell + g1 + titleH + g2 + ruleCell + g2 + subH;
+      return { tagCell: tagCell, subCell: subCell, ruleCell: ruleCell, g1: g1, g2: g2, titleH: titleH, subH: subH, total: total };
+    }
+
+    let cell = Math.floor(Math.min(
+      TW * (portrait ? 0.84 : 0.72) / maxCols,
+      TH * (portrait ? 0.30 : 0.24) / rows
+    ) * CONFIG.titleScale);
+    cell = Math.max(cell, 3);
+
+    let m = measureStack(cell);
+    while (m.total > TH * 0.86 && cell > 3) {        // make sure the whole stack fits on screen
+      cell--;
+      m = measureStack(cell);
+    }
+
+    // Vertical stack, centred in the middle of the screen
+    const top = Math.round((TH - m.total) / 2);
+    const tagY = top;
+    const titleY = tagY + 7 * m.tagCell + m.g1;
+    const ruleY = titleY + m.titleH + m.g2;
+    const subY = ruleY + m.ruleCell + m.g2;
+
+    T.cell = cell;
+    T.size = cell - Math.max(1, Math.round(cell * 0.07));
+    T.titleH = m.titleH;
+
+    // Small text above/below the title
+    T.tag = makeTextSprite(TAG_TEXT, m.tagCell, m.tagCell * 2.5);
+    T.tagX = Math.round((TW - T.tag.cols * m.tagCell) / 2);
+    T.tagY = tagY;
+
+    T.sub = [makeTextSprite(SUB_1, m.subCell, m.subCell * 2.5), makeTextSprite(SUB_2, m.subCell, m.subCell * 2.5)];
+    T.subX = [Math.round((TW - T.sub[0].cols * m.subCell) / 2), Math.round((TW - T.sub[1].cols * m.subCell) / 2)];
+    T.subY = [subY, subY + 10 * m.subCell];
+
+    T.rule = { cell: m.ruleCell, cols: 14, x: Math.round((TW - 14 * m.ruleCell) / 2), y: ruleY };
+
+    // Corner labels
+    const margin = Math.round(Math.max(16 * dpr, TW * 0.025));
+    const envCols = layoutText('INTERACTIVE ENVIRONMENT').cols;
+    const hintCols = layoutText(HINT_TEXT).cols;
+    const cc = Math.max(2, Math.min(m.tagCell, Math.floor((TW - margin * 3) / (envCols + hintCols))));
+
+    T.dot = makeTextSprite('*', cc, cc * 3);
+    T.dotX = margin;
+    T.dotY = margin;
+    T.status = makeTextSprite('SYSTEM ONLINE', cc, cc * 2.5);
+    T.statusX = margin + 8 * cc;
+    T.statusY = margin;
+
+    T.env = makeTextSprite('INTERACTIVE ENVIRONMENT', cc, cc * 2.5);
+    T.envX = margin;
+    T.envY = TH - margin - 7 * cc;
+    T.copy = makeTextSprite('© 2026', cc, cc * 2.5);
+    T.copyX = margin;
+    T.copyY = T.envY - 10 * cc;
+
+    T.hint = makeTextSprite(HINT_TEXT, cc, cc * 2.5);
+    T.hintX = TW - margin - T.hint.cols * cc;
+    T.hintY = TH - margin - 7 * cc;
+
+    // ---- The big title: one object per pixel ----
+    const introDone = clockTime > 5;                  // don't replay the intro if you just resized
+    const pixels = [];
+    let minX = 1e9, maxX = -1e9;
+    lineData.forEach(function (ld, li) {
+      const x0 = Math.round((TW - ld.cols * cell) / 2);
+      const y0 = titleY + li * 9 * cell;
+      for (let i = 0; i < ld.cells.length; i += 2) {
+        const hx = x0 + ld.cells[i] * cell;
+        const hy = y0 + ld.cells[i + 1] * cell;
+        if (hx < minX) minX = hx;
+        if (hx > maxX) maxX = hx;
+        pixels.push({ hx: hx, hy: hy, nx: 0, sx: 0, sy: 0, delay: 0, dur: 1, seed: Math.random(),
+                      ox: 0, oy: 0, x: 0, y: 0, a: 0, b: 1 });
+      }
+    });
+    T.left = minX;
+    T.width = maxX - minX + cell;
+    T.cx = TW / 2;
+    T.cy = titleY + m.titleH / 2;
+
+    const spread = Math.min(TW, TH);
+    for (let i = 0; i < pixels.length; i++) {
+      const p = pixels[i];
+      p.nx = (p.hx - T.left) / T.width;
+      const ang = Math.random() * Math.PI * 2;
+      const dist = (0.12 + Math.random() * 0.5) * spread;
+      p.sx = Math.cos(ang) * dist;                    // where this pixel starts (scattered)
+      p.sy = Math.sin(ang) * dist * 0.7;
+      p.delay = introDone ? -10 : 0.35 + p.nx * 1.1 + Math.random() * 0.5;
+      p.dur = introDone ? 0.01 : 1.0 + Math.random() * 0.5;
+    }
+    T.pixels = pixels;
+  }
+
+  // Draws everything on the text canvas, once per frame.
+  function drawText(dt) {
+    const g = tctx;
+    const tt = reducedMotion ? 999 : clockTime;          // "text time" (skips animation if reduced motion)
+    const dpr = T.dpr;
+    const r = CONFIG.titleReaction;
+    const glowK = CONFIG.textGlow;
+    const cell = T.cell;
+    const size = T.size;
+
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = 1;
+    g.clearRect(0, 0, TW, TH);
+
+    // Pixels per 3D unit in the middle of the scene (so text and 3D world share one scale)
+    const ppu = (TH * 0.5) / (TAN_HALF_FOV * camera.position.z);
+
+    // Parallax: the title floats in front, the small text sits further back.
+    const tx = reducedMotion ? 0 : -steer.x * 14 * dpr * r;
+    const ty = reducedMotion ? 0 :  steer.y * 9 * dpr * r;
+    const bx2 = Math.round(tx * 0.5), by2 = Math.round(ty * 0.5);
+
+    // Cursor field position on the text canvas (lags slightly behind the cursor)
+    const disturb = shared.uDisturb.value;
+    const targetFx = (pointer.x * 0.5 + 0.5) * TW;
+    const targetFy = (0.5 - pointer.y * 0.5) * TH;
+    if (disturb < 0.01) {
+      field.x = targetFx;
+      field.y = targetFy;
+    } else {
+      const kf = smooth(dt, 7);
+      field.x += (targetFx - field.x) * kf;
+      field.y += (targetFy - field.y) * kf;
+    }
+    const R = CONFIG.cursorRadius * ppu;
+    const F = 0.42 * ppu * CONFIG.cursorForce;
+
+    // Active click shockwaves, converted to screen pixels (same speed as the 3D wave)
+    const waves = [];
+    for (let i = 0; i < 3; i++) {
+      const tp = textPulses[i];
+      const age = clockTime - tp.start;
+      if (tp.start >= 0 && age > 0 && age < PULSE_LIFE) {
+        waves.push({ x: tp.x, y: tp.y, front: age * PULSE_SPEED * ppu, fade: Math.exp(-age * 0.85) });
+      }
+    }
+    const waveW = 1.7 * ppu * 0.8;
+    const amp = 0.5 * ppu * CONFIG.clickStrength;
+
+    const sweep = ((tt * 0.11) % 1.9) - 0.45;            // a light band that slowly sweeps across the title
+    const introAlpha = clamp01((tt - 0.4) / 2.2);
+    const kOff = smooth(dt, 10);
+    const s = 1 + energy * 0.018;                        // the title swells slightly on click
+    const px = T.pixels;
+    const n = px.length;
+    let i;
+
+    // ---- 1. Update every title pixel ----
+    for (i = 0; i < n; i++) {
+      const p = px[i];
+      const prog = clamp01((tt - p.delay) / p.dur);
+      const a = clamp01(prog / 0.3);
+      if (a <= 0) { p.a = 0; continue; }
+
+      const e = easeOutCubic(prog);                      // 0 = scattered, 1 = arrived
+      let bx = p.hx + p.sx * (1 - e);
+      let by = p.hy + p.sy * (1 - e);
+      let bright = 1 + (1 - e) * 0.9;                    // pixels glow brighter while flying in
+
+      if (!reducedMotion) {
+        by += Math.sin(tt * 0.9 + p.nx * 6.0) * cell * 0.10 * e;   // slow wave through the letters
+        const d = (p.nx - sweep) / 0.07;
+        bright += 0.6 * Math.exp(-d * d) * e;                       // travelling highlight
+      }
+      bright *= 0.92 + 0.08 * Math.sin(tt * 1.7 + p.seed * 40);     // tiny twinkle
+
+      bx = T.cx + (bx - T.cx) * s + tx;
+      by = T.cy + (by - T.cy) * s + ty;
+
+      let tox = 0, toy = 0;
+
+      // Cursor gravity well (same maths as the shader)
+      if (disturb > 0.001) {
+        const dx = bx - field.x, dy = by - field.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < R * R && d2 > 1) {
+          const d = Math.sqrt(d2);
+          const well = Math.pow(Math.max(Math.sin((d / R) * Math.PI), 0), 1.5);
+          const ux = dx / d, uy = dy / d;
+          tox += (-ux - uy * 0.35) * well * F * disturb;
+          toy += (-uy + ux * 0.35) * well * F * disturb;
+          bright += well * 0.7 * disturb;
+        }
+      }
+
+      // Click shockwaves
+      for (let j = 0; j < waves.length; j++) {
+        const w = waves[j];
+        const dx = bx - w.x, dy = by - w.y;
+        const d = Math.sqrt(dx * dx + dy * dy) + 0.001;
+        const q = (d - w.front) / waveW;
+        const band = Math.exp(-q * q);
+        if (band < 0.01) continue;
+        const f = band * w.fade;
+        tox += (dx / d) * f * amp;
+        toy += (dy / d) * f * amp;
+        bright += f * 1.4;
+      }
+
+      // Smooth the displacement so pixels feel like they have weight
+      p.ox += (tox - p.ox) * kOff;
+      p.oy += (toy - p.oy) * kOff;
+      p.x = Math.round(bx + p.ox);
+      p.y = Math.round(by + p.oy);
+      p.a = a;
+      p.b = bright;
+    }
+
+    // ---- 2. Minecraft-style grey drop shadows (they shift with the cursor, like a light) ----
+    const lightK = reducedMotion ? 0 : 0.4 * r;
+    const sdx = Math.round(cell * (0.85 - steer.x * lightK));
+    const sdy = Math.round(cell * (0.85 + steer.y * lightK));
+    g.fillStyle = '#3a3a3a';
+    for (i = 0; i < n; i++) {
+      const p = px[i];
+      if (p.a < 0.02) continue;
+      g.globalAlpha = p.a;
+      g.fillRect(p.x + sdx, p.y + sdy, size, size);
+    }
+
+    // ---- 3. Glow (additive light) ----
+    g.globalCompositeOperation = 'lighter';
+    g.globalAlpha = Math.min(1, 0.12 * glowK * (1 + energy * 1.5) * introAlpha);
+    g.drawImage(haloSprite, T.cx - T.width * 0.85 + tx, T.cy - T.titleH * 1.6 + ty, T.width * 1.7, T.titleH * 3.2);
+    if (qualityLevel < 2) {
+      const hs = cell * 4.6;
+      for (i = 0; i < n; i++) {
+        const p = px[i];
+        if (p.a < 0.02) continue;
+        g.globalAlpha = Math.min(1, 0.10 * glowK * p.b * p.a * (1 + energy * 1.2));
+        g.drawImage(haloSprite, p.x + size / 2 - hs / 2, p.y + size / 2 - hs / 2, hs, hs);
+      }
+    }
+
+    // ---- 4. The white pixels ----
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = '#ffffff';
+    for (i = 0; i < n; i++) {
+      const p = px[i];
+      if (p.a < 0.02) continue;
+      g.globalAlpha = Math.min(1, p.a * (0.8 + 0.2 * p.b));
+      g.fillRect(p.x, p.y, size, size);
+    }
+
+    // ---- 5. Small text: types itself out, one character at a time ----
+    g.globalCompositeOperation = 'source-over';
+    drawSprite(T.tag, T.tagX + bx2, T.tagY + by2, clamp01((tt - 1.8) / 1.4), 0.85);
+
+    const ruleP = clamp01((tt - 2.7) / 0.9);              // the short line grows outwards from the centre
+    if (ruleP > 0) {
+      const rc = T.rule;
+      const cols = Math.max(1, Math.round(rc.cols * easeOutCubic(ruleP)));
+      const w = cols * rc.cell;
+      const x = rc.x + Math.round((rc.cols * rc.cell - w) / 2) + bx2;
+      const y = rc.y + by2;
+      g.globalCompositeOperation = 'lighter';
+      g.globalAlpha = 0.25 * glowK;
+      g.drawImage(haloSprite, x - rc.cell * 3, y - rc.cell * 4, w + rc.cell * 6, rc.cell * 9);
+      g.globalCompositeOperation = 'source-over';
+      g.globalAlpha = 0.9;
+      g.fillStyle = '#ffffff';
+      g.fillRect(x, y, w, rc.cell);
+    }
+
+    const n1 = T.sub[0].chars, n2 = T.sub[1].chars;
+    const typed = Math.floor(clamp01((tt - 3.0) / 2.4) * (n1 + n2) + 0.0001);
+    drawSprite(T.sub[0], T.subX[0] + bx2, T.subY[0] + by2, clamp01(typed / n1), 0.9);
+    drawSprite(T.sub[1], T.subX[1] + bx2, T.subY[1] + by2, clamp01((typed - n1) / n2), 0.9);
+
+    // Blinking underscore cursor while (and shortly after) typing, like Minecraft's chat
+    if (tt > 3.0 && tt < 8.4 && Math.floor(tt * 2) % 2 === 0) {
+      const line = typed <= n1 ? 0 : 1;
+      const nn = line === 0 ? typed : typed - n1;
+      const sp = T.sub[line];
+      const cx = T.subX[line] + bx2 + (nn > 0 ? (sp.edges[nn - 1] - sp.pad) + sp.cell : 0);
+      g.globalAlpha = 0.9;
+      g.fillStyle = '#ffffff';
+      g.fillRect(cx, T.subY[line] + by2 + 6 * sp.cell, 5 * sp.cell, sp.cell);
+    }
+
+    // ---- 6. Corner labels ----
+    const cP = clamp01((tt - 3.4) / 1.6);
+    const dotPulse = reducedMotion ? 1 : 0.3 + 0.7 * (0.5 + 0.5 * Math.cos(tt * 1.96));
+    drawSprite(T.dot, T.dotX, T.dotY, cP > 0 ? 1 : 0, dotPulse);
+    drawSprite(T.status, T.statusX, T.statusY, cP, 0.75);
+    drawSprite(T.copy, T.copyX, T.copyY, cP, 0.7);
+    drawSprite(T.env, T.envX, T.envY, cP, 0.7);
+    drawSprite(T.hint, T.hintX, T.hintY, cP, 0.7);
+
+    g.globalAlpha = 1;
+  }
+
+  /* =======================================================================
+     9. ANIMATION LOOP
+     ======================================================================= */
+  const cursorTarget = new THREE.Vector3();
+  let lastTime = performance.now();
+  let firstFrameDone = false;
+  let resizePending = true;
+
+  // If the average frame is slower than ~40fps, step down one quality level.
+  let perfFrames = 0, perfTime = 0, perfWarmup = 45;
+  function monitorPerformance(dt) {
+    if (qualityLevel >= QUALITY_LEVELS.length - 1) return;
+    if (perfWarmup > 0) { perfWarmup--; return; }
+    perfFrames++;
+    perfTime += dt;
+    if (perfFrames >= 90) {
+      if (perfTime / perfFrames > 1 / 40) {
+        qualityLevel++;
+        applyQuality();
+        perfWarmup = 30;
+      }
+      perfFrames = 0;
+      perfTime = 0;
+    }
+  }
+
+  function applyQuality() {
+    const q = QUALITY_LEVELS[qualityLevel];
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
+    renderer.setSize(width, height, false);
+    shared.uPixelRatio.value = renderer.getPixelRatio();
+    particles.geometry.setDrawRange(0, Math.floor(particleCount * q.particles));
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+
+    const dt = Math.min((now - lastTime) / 1000, 0.05);
+    lastTime = now;
+    if (dt <= 0) return;
+
+    if (resizePending) { resizePending = false; handleResize(); }
+
+    clockTime += dt;
+    simTime += dt * CONFIG.animationSpeed * (reducedMotion ? 0.3 : 1);
+    const t = simTime;
+    shared.uTime.value = t;
+    shared.uClock.value = clockTime;
+
+    // Where should the scene lean? (touch devices drift on their own when idle)
+    const auto = isTouch && !reducedMotion && (clockTime - pointer.lastInput > 3);
+    const targetX = auto ? Math.sin(t * 0.23) * 0.55 : pointer.x;
+    const targetY = auto ? Math.cos(t * 0.17) * 0.35 : pointer.y;
+    const ks = smooth(dt, auto ? 1.2 : 5);
+    steer.x += (targetX - steer.x) * ks;
+    steer.y += (targetY - steer.y) * ks;
+
+    energy *= Math.exp(-dt * 1.6);
+    if (energy < 0.001) energy = 0;
+    shared.uBoost.value = energy * 0.8;
+
+    // Layers
+    for (let i = 0; i < layers.length; i++) {
+      const L = layers[i];
+      const kr = smooth(dt, L.rate);
+      L.px += (steer.x - L.px) * kr;
+      L.py += (steer.y - L.py) * kr;
+
+      const o = L.object;
+      o.rotation.x = L.offset[0] + t * L.spin[0] + Math.sin(t * 0.13 + L.phase) * 0.10 - L.py * L.gain[0] * SENS;
+      o.rotation.y = L.offset[1] + t * L.spin[1] + Math.cos(t * 0.09 + L.phase * 1.7) * 0.12 + L.px * L.gain[1] * SENS;
+      o.rotation.z = L.offset[2] + t * L.spin[2] + Math.sin(t * 0.07 + L.phase * 2.3) * 0.08;
+
+      const breath = Math.sin(t * 0.31 + L.phase) * 0.6 + Math.sin(t * 0.53 + L.phase * 0.7) * 0.4;
+      o.scale.setScalar(1 + breath * L.breathe + energy * L.pulse);
+    }
+
+    // Distant layer moves less (parallax)
+    const kf = smooth(dt, 0.8);
+    far.userData.px = (far.userData.px || 0) + (steer.x - (far.userData.px || 0)) * kf;
+    far.userData.py = (far.userData.py || 0) + (steer.y - (far.userData.py || 0)) * kf;
+    far.rotation.y = t * 0.004 + far.userData.px * 0.08 * SENS;
+    far.rotation.x = -far.userData.py * 0.05 * SENS;
+
+    // Camera
+    const kc = smooth(dt, 2.2);
+    const cx = steer.x * 2.0 * SENS + Math.sin(t * 0.07) * 0.7;
+    const cy = steer.y * 1.2 * SENS + Math.cos(t * 0.053) * 0.45;
+    const cz = baseZ + Math.sin(t * 0.09) * 0.7 - energy * 0.7;
+    camera.position.x += (cx - camera.position.x) * kc;
+    camera.position.y += (cy - camera.position.y) * kc;
+    camera.position.z += (cz - camera.position.z) * kc;
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld();
+
+    // Cursor gravity field
+    const wantField = pointer.inside && !isTouch && !reducedMotion;
+    shared.uDisturb.value += ((wantField ? 1 : 0) - shared.uDisturb.value) * smooth(dt, 2.5);
+    if (wantField || shared.uDisturb.value > 0.001) {
+      pointerToWorld(pointer.x, pointer.y, cursorTarget);
+      if (shared.uDisturb.value < 0.01) {
+        shared.uMouse.value.copy(cursorTarget);
+      } else {
+        shared.uMouse.value.lerp(cursorTarget, smooth(dt, 7));
+      }
+    }
+
+    // Click rings
+    for (let i = 0; i < pulseRings.length; i++) {
+      const r = pulseRings[i];
+      const age = clockTime - r.start;
+      if (r.start < 0 || age > PULSE_LIFE) { r.mesh.visible = false; continue; }
+      const p = age / PULSE_LIFE;
+      r.mesh.visible = true;
+      r.mesh.scale.setScalar(Math.max(age * PULSE_SPEED, 0.01));
+      r.mesh.quaternion.copy(camera.quaternion);
+      r.mesh.material.opacity = 0.5 * (1 - p) * (1 - p) * Math.min(CONFIG.clickStrength, 1.5);
+    }
+
+    renderer.render(scene, camera);
+    drawText(dt);
+    monitorPerformance(dt);
+
+    if (!firstFrameDone) {
+      firstFrameDone = true;
+      root.classList.add('is-ready');      // fades the 3D canvas in
+    }
+  }
+
+  /* =======================================================================
+     10. RESIZE HANDLING
+     (Entering/leaving fullscreen also triggers this, so everything re-fits.)
+     ======================================================================= */
+  function handleResize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+    updateCameraFraming();
+    applyQuality();
+    buildTextLayout();
+  }
+  window.addEventListener('resize', function () { resizePending = true; });
+
+  canvas.addEventListener('webglcontextlost', function (e) { e.preventDefault(); });
+
+  // Go!
+  handleResize();
+  requestAnimationFrame(frame);
+})();
+  </script>
+</body>
+</html>
